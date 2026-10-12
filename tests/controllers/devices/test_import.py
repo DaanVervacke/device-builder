@@ -241,6 +241,120 @@ async def test_import_device_falls_back_to_wifi_for_old_factory_firmware(
     assert "ssid: !secret wifi_ssid" in (tmp_path / "legacy-bulb.yaml").read_text(encoding="utf-8")
 
 
+async def test_import_device_wifi_broadcast_drops_wifi_when_package_supplies_ethernet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """A dual-interface device broadcasts TXT ``network=wifi`` even on a cable.
+
+    The compiled-in Wi-Fi wins the TXT branch, so the broadcast says
+    nothing about the active link. The resolved package does: a vendor
+    config carrying ``ethernet:`` means the adoption needs no Wi-Fi
+    block and no credentials.
+    """
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.resolve.load_device_yaml",
+        lambda path: {"esphome": {}, "ethernet": {"type": "W5500"}},
+    )
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+    ctrl.state.import_result["aux-2-1a2b3c"] = AdoptableDevice(
+        name="aux-2-1a2b3c",
+        friendly_name="AUX-2",
+        package_import_url="github://example/aux-2.yaml@main",
+        project_name="example.aux-2",
+        project_version="1.0.0",
+        network="wifi",
+        ignored=False,
+    )
+
+    await ctrl.import_device(
+        name="aux-2-1a2b3c",
+        project_name="example.aux-2",
+        package_import_url="github://example/aux-2.yaml@main",
+        encryption="true",
+    )
+
+    content = (tmp_path / "aux-2-1a2b3c.yaml").read_text(encoding="utf-8")
+    assert "wifi:" not in content
+    assert "!secret wifi_ssid" not in content
+    assert 'api:\n  encryption:\n    key: "' in content
+
+
+async def test_import_device_wifi_broadcast_keeps_wifi_when_package_brings_no_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """A Wi-Fi-only vendor package keeps the generated ``wifi:`` block."""
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.resolve.load_device_yaml",
+        lambda path: {"esphome": {}},
+    )
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+    ctrl.state.import_result["bulb-1a2b3c"] = AdoptableDevice(
+        name="bulb-1a2b3c",
+        friendly_name="Bulb",
+        package_import_url="github://example/bulb.yaml@main",
+        project_name="example.bulb",
+        project_version="1.0.0",
+        network="wifi",
+        ignored=False,
+    )
+
+    await ctrl.import_device(
+        name="bulb-1a2b3c",
+        project_name="example.bulb",
+        package_import_url="github://example/bulb.yaml@main",
+    )
+
+    assert "ssid: !secret wifi_ssid" in (tmp_path / "bulb-1a2b3c.yaml").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "loaded",
+    [
+        pytest.param(None, id="unparsable"),
+        pytest.param(
+            {"packages": {"v": "github://example/bulb.yaml@main"}, "esphome": {}},
+            id="unmerged_packages",
+        ),
+    ],
+)
+async def test_import_device_wifi_broadcast_unresolvable_package_keeps_wifi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+    loaded: dict[str, Any] | None,
+) -> None:
+    """Without a complete package merge the Wi-Fi block stays: the TXT-safe default."""
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.resolve.load_device_yaml",
+        lambda path: loaded,
+    )
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+    ctrl.state.import_result["bulb-1a2b3c"] = AdoptableDevice(
+        name="bulb-1a2b3c",
+        friendly_name="Bulb",
+        package_import_url="github://example/bulb.yaml@main",
+        project_name="example.bulb",
+        project_version="1.0.0",
+        network="wifi",
+        ignored=False,
+    )
+
+    await ctrl.import_device(
+        name="bulb-1a2b3c",
+        project_name="example.bulb",
+        package_import_url="github://example/bulb.yaml@main",
+    )
+
+    assert "ssid: !secret wifi_ssid" in (tmp_path / "bulb-1a2b3c.yaml").read_text(encoding="utf-8")
+
+
 async def test_import_device_without_encryption_omits_api(
     tmp_path: Path,
     make_controller: MakeControllerFactory,
@@ -1354,6 +1468,34 @@ async def test_import_device_existing_file_is_not_rolled_back(
     assert "kitchen" not in ctrl.state.adopting
 
 
+async def test_import_device_push_during_the_network_reconcile_lands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """A key pushed while the fallback rewrite restores the wifi block is consumed."""
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.resolve.load_device_yaml", lambda path: None
+    )
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+    real_write = ctrl._write_yaml_atomic_async
+
+    async def _write(path: Path, content: str) -> None:
+        if "key:" not in content:
+            await ctrl.set_encryption_key(name="kitchen", key=OTHER_KEY)
+        await real_write(path, content)
+
+    monkeypatch.setattr(ctrl, "_write_yaml_atomic_async", _write)
+
+    result = await _import_kitchen(ctrl)
+
+    content = (tmp_path / "kitchen.yaml").read_text(encoding="utf-8")
+    assert f'key: "{OTHER_KEY}"' in content
+    assert ctrl._pending_keys.get("kitchen") is None
+    assert "warning" not in result
+
+
 async def test_import_device_warns_when_a_push_lands_during_the_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1368,7 +1510,8 @@ async def test_import_device_warns_when_a_push_lands_during_the_write(
     real_write = ctrl._write_yaml_atomic_async
 
     async def _write(path: Path, content: str) -> None:
-        await ctrl.set_encryption_key(name="kitchen", key=OTHER_KEY)
+        if "key:" in content:
+            await ctrl.set_encryption_key(name="kitchen", key=OTHER_KEY)
         await real_write(path, content)
 
     monkeypatch.setattr(ctrl, "_write_yaml_atomic_async", _write)

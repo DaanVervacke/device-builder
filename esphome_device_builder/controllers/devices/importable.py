@@ -14,6 +14,7 @@ from ...helpers.api import CommandError
 from ...helpers.async_ import run_in_executor
 from ...helpers.atomic_io import atomic_write_exclusive
 from ...helpers.device_yaml import (
+    NETWORK_PROVIDER_COMPONENT_IDS,
     generate_adoption_yaml,
     get_ota_encryption_key,
     ota_encryption_block_unresolved,
@@ -137,13 +138,17 @@ async def import_device(
             api_encryption_key=pending["key"] if pending else None,
         )
         content = source.content
+        no_wifi = source.content_without_wifi
         try:
-            await run_in_executor(atomic_write_exclusive, path, content.encode("utf-8"))
+            initial = no_wifi if no_wifi is not None else content
+            await run_in_executor(atomic_write_exclusive, path, initial.encode("utf-8"))
         except FileExistsError as exc:
             msg = f"Configuration {configuration} already exists"
             raise CommandError(ErrorCode.INVALID_ARGS, msg) from exc
 
         async with _rolled_back_on_failure(path):
+            if no_wifi is not None:
+                content = await _prefer_package_network(controller, path, no_wifi, content)
             ctx = _AdoptionKeyContext(controller, name, path, content, verbatim=source.verbatim)
             # Adopt tolerates a validator timeout on a short budget: the config's
             # ``github://`` fetch can outlast a full validate.
@@ -226,11 +231,12 @@ async def _name_claimed(controller: DevicesController, name: str) -> AsyncIterat
 
 
 class _AdoptionSource(NamedTuple):
-    """The YAML to write, whether it is the upstream text verbatim, and any fallback note."""
+    """The YAML to write, its no-wifi variant, the verbatim upstream flag, and any note."""
 
     content: str
     verbatim: bool
     warning: str | None = None
+    content_without_wifi: str | None = None
 
 
 async def _adoption_source(
@@ -264,7 +270,34 @@ async def _adoption_source(
         network_provided=network_provided,
         api_encryption_key=api_encryption_key,
     )
-    return _AdoptionSource(content, verbatim=False, warning=warning)
+    without_wifi = None
+    if not network_provided:
+        without_wifi = generate_adoption_yaml(
+            name,
+            friendly_name,
+            project_name,
+            package_url,
+            network_provided=True,
+            api_encryption_key=api_encryption_key,
+        )
+    return _AdoptionSource(
+        content, verbatim=False, warning=warning, content_without_wifi=without_wifi
+    )
+
+
+async def _prefer_package_network(
+    controller: DevicesController, path: Path, no_wifi: str, with_wifi: str
+) -> str:
+    """
+    Return the YAML to import and leave it on *path*.
+
+    The no-wifi form when the resolved package supplies the network, else *with_wifi*.
+    """
+    merged, resolved = await resolve_config(controller, path, spawn=False)
+    if resolved and merged is not None and not NETWORK_PROVIDER_COMPONENT_IDS.isdisjoint(merged):
+        return no_wifi
+    await controller._write_yaml_atomic_async(path, with_wifi)
+    return with_wifi
 
 
 @asynccontextmanager
